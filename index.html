@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Penilai Lokomotor 1.2.3</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding-bottom: 40px; font-family: -apple-system, Arial, sans-serif; background: #111; color: #fff; text-align: center; }
+  h1 { font-size: 19px; margin: 12px 8px 2px; }
+  .sub { font-size: 12px; color: #aaa; margin: 0 8px 8px; }
+  #stage { position: relative; width: 100%; max-width: 480px; margin: 0 auto; background: #000; }
+  video, canvas { width: 100%; display: block; }
+  canvas { position: absolute; top: 0; left: 0; }
+  .mirror video, .mirror canvas { transform: scaleX(-1); }
+  #hud { font-size: 22px; font-weight: bold; min-height: 30px; margin: 8px 8px 0; color: #ffd54f; }
+  #live { font-size: 14px; min-height: 20px; color: #b2ebf2; margin: 2px 8px 8px; }
+  .row { margin: 4px 8px; }
+  input, select { padding: 11px; font-size: 16px; border-radius: 8px; border: none; margin: 3px; max-width: 46%; }
+  button { padding: 13px 20px; font-size: 17px; border: none; border-radius: 10px; margin: 6px 4px; color: #fff; }
+  #btnMula { background: #2e7d32; }
+  #btnHantar { background: #1565c0; }
+  button:disabled { opacity: .4; }
+  #hasil { max-width: 480px; margin: 10px auto; padding: 0 10px; text-align: left; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 8px 6px; border-bottom: 1px solid #333; vertical-align: top; }
+  td.skor { white-space: nowrap; font-weight: bold; text-align: right; }
+  .jumlah td { font-size: 20px; border-bottom: none; color: #81c784; }
+  .nota { font-size: 12px; color: #999; margin: 8px; }
+</style>
+</head>
+<body>
+<h1>Penilai Pergerakan Lokomotor</h1>
+<p class="sub">Standard 1.2.3: arah, aras, laluan dan kelajuan</p>
+
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+</div>
+<div id="hud">Tekan "Mula"</div>
+<div id="live"></div>
+
+<div class="row">
+  <input id="nama" type="text" placeholder="Nama murid">
+  <input id="kelas" type="text" placeholder="Kelas">
+</div>
+<div class="row">
+  <select id="kamera">
+    <option value="user">Kamera depan</option>
+    <option value="environment">Kamera belakang</option>
+  </select>
+  <select id="tempoh">
+    <option value="20">20 saat</option>
+    <option value="30" selected>30 saat</option>
+    <option value="45">45 saat</option>
+  </select>
+</div>
+<div class="row">
+  <button id="btnMula">Mula</button>
+  <button id="btnHantar" disabled>Hantar</button>
+</div>
+
+<div id="hasil"></div>
+<p class="nota">Letak telefon setinggi pinggang, 4 hingga 5 meter dari kawasan bergerak. Semasa 3 saat pertama, murid berdiri tegak menghadap kamera. Selepas itu murid bergerak bebas mengikut arahan guru.</p>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ====== TETAPAN: tampal URL Apps Script anda di sini ======
+const APPS_SCRIPT_URL = "TEMPEL_URL_APPS_SCRIPT_DI_SINI";
+// ==========================================================
+
+// ==ANALISIS-MULA==
+// Semua nilai di bawah ialah anggaran awal. Ujian dengan murid sebenar, kemudian laraskan.
+// TL = panjang batang tubuh murid (bahu ke pinggul) semasa berdiri tegak.
+const CFG = {
+  CALIB_SAAT: 3,
+  DZ_FAKTOR: 8,           // anggaran jarak kamera / panjang batang tubuh (kira-kira 4 m / 0.5 m)
+  WIN: 0.5,               // saat, tetingkap mengukur pergerakan
+  GERAK_MIN: 0.8,         // TL/saat; di bawah ini dianggap berhenti
+  ARAH_MIN: 0.8,          // TL/saat; komponen minimum untuk dikira satu arah
+  LAJU_PERLAHAN_MAX: 2.0, // TL/saat
+  LAJU_SEDERHANA_MAX: 4.0,// TL/saat; di atas ini dikira laju
+  ARAS_TINGGI: -0.25,     // pinggul naik lebih daripada 0.25 TL (lompat, jengket)
+  ARAS_RENDAH: 0.35,      // pinggul turun lebih daripada 0.35 TL (mencangkung, membongkok)
+  MASA_ARAH: 1.0,         // saat minimum supaya satu arah dikira digunakan
+  MASA_ARAS: 0.4,
+  MASA_LAJU: 1.0,
+  PUSING_DEG: 50,         // perubahan arah melebihi ini dikira satu pusingan
+  LURUS_DEG: 25,          // perubahan arah kurang daripada ini dikira lurus
+  LURUS_TETINGKAP: 3      // bilangan tetingkap berturut-turut untuk dikira laluan lurus
+};
+
+let base = null;
+
+function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
+function median(a) { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; }
+
+function computeBase(calib) {
+  if (calib.length < 15) return null;
+  const b = {
+    hy: median(calib.map(s => s.hy)),
+    sw: median(calib.map(s => s.sw)),
+    tl: median(calib.map(s => s.tl))
+  };
+  return (b.tl > 20 && b.sw > 10) ? b : null;
+}
+
+function levelOf(s) {
+  const sc = clamp(s.sw / base.sw, 0.4, 2.5);
+  const lv = (s.hy - base.hy) / (base.tl * sc);
+  return lv < CFG.ARAS_TINGGI ? "Tinggi" : lv > CFG.ARAS_RENDAH ? "Rendah" : "Sederhana";
+}
+
+// vx positif = kanan murid, vz positif = ke arah kamera (unit: TL/saat)
+function motion(s0, s1) {
+  const dt = s1.t - s0.t;
+  if (dt < 0.2) return null;
+  const sc = clamp(((s0.sw + s1.sw) / 2) / base.sw, 0.4, 2.5);
+  const unit = base.tl * sc;
+  const vx = -(s1.hx - s0.hx) / unit / dt;
+  const vz = (s1.sw / s0.sw - 1) * CFG.DZ_FAKTOR / dt;
+  return { vx, vz, speed: Math.hypot(vx, vz) };
+}
+
+function dirsOf(m) {
+  const d = [];
+  if (m.vx > CFG.ARAH_MIN) d.push("Kanan");
+  if (m.vx < -CFG.ARAH_MIN) d.push("Kiri");
+  if (m.vz > CFG.ARAH_MIN) d.push("Hadapan");
+  if (m.vz < -CFG.ARAH_MIN) d.push("Belakang");
+  return d;
+}
+
+function smooth(arr) {
+  const k = 2;
+  return arr.map((s, i) => {
+    let hx = 0, hy = 0, sw = 0, n = 0;
+    for (let j = Math.max(0, i - k); j <= Math.min(arr.length - 1, i + k); j++) {
+      hx += arr[j].hx; hy += arr[j].hy; sw += arr[j].sw; n++;
+    }
+    return { t: s.t, hx: hx / n, hy: hy / n, sw: sw / n, tl: s.tl };
+  });
+}
+
+function sampleAt(S, t) {
+  let r = S[0];
+  for (let i = 0; i < S.length; i++) { if (S[i].t <= t) r = S[i]; else break; }
+  return r;
+}
+
+function analyse(samples) {
+  const S = smooth(samples);
+  if (S.length < 30) return null;
+
+  const tArah = { Kiri: 0, Kanan: 0, Hadapan: 0, Belakang: 0 };
+  const tAras = { Tinggi: 0, Sederhana: 0, Rendah: 0 };
+  const tLaju = { Perlahan: 0, Sederhana: 0, Laju: 0 };
+
+  for (let i = 1; i < S.length; i++) {
+    tAras[levelOf(S[i])] += Math.min(S[i].t - S[i - 1].t, 0.2);
+  }
+
+  let prevHead = null, turns = 0, run = 1, straight = false;
+  const last = S[S.length - 1].t;
+  for (let t = S[0].t; t + CFG.WIN <= last; t += CFG.WIN) {
+    const m = motion(sampleAt(S, t), sampleAt(S, t + CFG.WIN));
+    if (!m || m.speed < CFG.GERAK_MIN) continue;
+    dirsOf(m).forEach(d => { tArah[d] += CFG.WIN; });
+    const cls = m.speed < CFG.LAJU_PERLAHAN_MAX ? "Perlahan" : m.speed < CFG.LAJU_SEDERHANA_MAX ? "Sederhana" : "Laju";
+    tLaju[cls] += CFG.WIN;
+    const head = Math.atan2(m.vz, m.vx) * 180 / Math.PI;
+    if (prevHead !== null) {
+      let d = Math.abs(head - prevHead);
+      if (d > 180) d = 360 - d;
+      if (d > CFG.PUSING_DEG) { turns++; run = 1; }
+      else if (d < CFG.LURUS_DEG) { run++; if (run >= CFG.LURUS_TETINGKAP) straight = true; }
+      else { run = 1; }
+    }
+    prevHead = head;
+  }
+
+  const pakai = (obj, min) => Object.keys(obj).filter(k => obj[k] >= min);
+  const arahList = pakai(tArah, CFG.MASA_ARAH);
+  const arasList = pakai(tAras, CFG.MASA_ARAS);
+  const lajuList = pakai(tLaju, CFG.MASA_LAJU);
+
+  const skorArah = Math.round(25 * arahList.length / 4);
+  const skorAras = Math.round(25 * arasList.length / 3);
+  const skorLaju = Math.round(25 * lajuList.length / 3);
+  const skorLaluan = (straight ? 10 : 0) + (turns >= 2 ? 15 : turns === 1 ? 7 : 0);
+
+  return {
+    arah: { skor: skorArah, senarai: arahList },
+    aras: { skor: skorAras, senarai: arasList },
+    laju: { skor: skorLaju, senarai: lajuList },
+    laluan: { skor: skorLaluan, lurus: straight, pusingan: turns },
+    jumlah: skorArah + skorAras + skorLaju + skorLaluan
+  };
+}
+function setBase(b) { base = b; }
+// ==ANALISIS-TAMAT==
+
+// ---------- Elemen halaman ----------
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+const stageEl = $("stage"), hud = $("hud"), live = $("live"), hasil = $("hasil");
+const btnMula = $("btnMula"), btnHantar = $("btnHantar");
+
+let poseLandmarker = null;
+let running = false;
+let phase = "idle";   // idle | calib | rec | done
+let phaseStart = 0;
+let calib = [], samples = [], trail = [];
+let lastVideoTime = -1;
+let lastResult = null;
+let recSeconds = 30;
+
+async function loadModel() {
+  hud.textContent = "Memuat turun model AI...";
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  const opts = delegate => ({
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+  try {
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, opts("GPU"));
+  } catch (e) {
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, opts("CPU"));
+  }
+}
+
+async function startCamera(mode) {
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: mode }, width: { ideal: 640 }, height: { ideal: 480 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await new Promise(res => (video.onloadedmetadata = res));
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  stageEl.classList.toggle("mirror", mode === "user");
+}
+
+function readPose(lm, t) {
+  const W = canvas.width, H = canvas.height;
+  if ([11, 12, 23, 24].some(i => (lm[i].visibility || 0) < 0.5)) return null;
+  const hx = (lm[23].x + lm[24].x) / 2 * W, hy = (lm[23].y + lm[24].y) / 2 * H;
+  const sx = (lm[11].x + lm[12].x) / 2 * W, sy = (lm[11].y + lm[12].y) / 2 * H;
+  const sw = Math.hypot((lm[11].x - lm[12].x) * W, (lm[11].y - lm[12].y) * H);
+  const tl = Math.hypot(sx - hx, sy - hy);
+  if (sw < 5) return null;
+  return { t, hx, hy, sw, tl };
+}
+
+function drawTrail() {
+  if (trail.length < 2) return;
+  ctx.strokeStyle = "#00e5ff";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  trail.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+  ctx.stroke();
+}
+
+const NAMA_ARAH = { Kiri: "Kiri", Kanan: "Kanan", Hadapan: "Ke kamera", Belakang: "Jauh dari kamera" };
+
+function liveText(s) {
+  let txt = "Aras: " + levelOf(s);
+  const s0 = sampleAt(samples, s.t - CFG.WIN);
+  const m = motion(s0, s);
+  if (m && m.speed >= CFG.GERAK_MIN) {
+    const cls = m.speed < CFG.LAJU_PERLAHAN_MAX ? "perlahan" : m.speed < CFG.LAJU_SEDERHANA_MAX ? "sederhana" : "laju";
+    txt += " | Arah: " + (dirsOf(m).map(d => NAMA_ARAH[d]).join(" + ") || "-") + " | Kelajuan: " + cls;
+  } else {
+    txt += " | Berhenti";
+  }
+  live.textContent = txt;
+}
+
+function loop() {
+  if (!running) return;
+  const now = performance.now() / 1000;
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = poseLandmarker.detectForVideo(video, performance.now());
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const lm = res.landmarks && res.landmarks[0];
+    if (lm) {
+      const du = new DrawingUtils(ctx);
+      du.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: "#00e676", lineWidth: 3 });
+      du.drawLandmarks(lm, { color: "#ff5252", radius: 3 });
+      const s = readPose(lm, now - phaseStart);
+      if (s) {
+        if (phase === "calib") calib.push(s);
+        if (phase === "rec") {
+          samples.push(s);
+          trail.push([s.hx, s.hy]);
+          liveText(s);
+        }
+      } else if (phase !== "done") {
+        live.textContent = "Pastikan badan (bahu hingga pinggul) nampak jelas.";
+      }
+    } else if (phase !== "done") {
+      live.textContent = "Tiada orang dikesan.";
+    }
+    drawTrail();
+  }
+  tick(now);
+  requestAnimationFrame(loop);
+}
+
+function tick(now) {
+  const el = now - phaseStart;
+  if (phase === "calib") {
+    hud.textContent = "Berdiri tegak... " + Math.max(0, Math.ceil(CFG.CALIB_SAAT - el));
+    if (el >= CFG.CALIB_SAAT) {
+      const b = computeBase(calib);
+      if (!b) {
+        stop("Badan tidak nampak jelas semasa kalibrasi. Cuba lagi.");
+        return;
+      }
+      setBase(b);
+      phase = "rec";
+      phaseStart = performance.now() / 1000;
+      trail = [];
+      samples = [];
+    }
+  } else if (phase === "rec") {
+    const remain = recSeconds - el;
+    hud.textContent = "Bergerak! " + Math.max(0, Math.ceil(remain)) + " saat";
+    if (remain <= 0) finish();
+  }
+}
+
+function stop(msg) {
+  running = false;
+  phase = "idle";
+  hud.textContent = msg || "";
+  btnMula.disabled = false;
+  btnMula.textContent = "Mula";
+}
+
+function finish() {
+  running = false;
+  phase = "done";
+  const r = analyse(samples);
+  btnMula.disabled = false;
+  btnMula.textContent = "Ulang";
+  if (!r) {
+    hud.textContent = "Data tidak mencukupi. Cuba lagi.";
+    return;
+  }
+  lastResult = r;
+  hud.textContent = "Selesai! Jumlah: " + r.jumlah + " / 100";
+  live.textContent = "";
+  showResult(r);
+  btnHantar.disabled = false;
+}
+
+const senaraiText = (arr, peta) => arr.length ? arr.map(k => (peta && peta[k]) || k).join(", ") : "tiada";
+
+function showResult(r) {
+  const laluanTxt = (r.laluan.lurus ? "Ada laluan lurus. " : "Tiada laluan lurus. ") +
+    "Perubahan arah: " + r.laluan.pusingan + (r.laluan.pusingan >= 2 ? " (zig-zag atau melengkung)." : ".");
+  hasil.innerHTML = `
+    <table>
+      <tr><td><b>Arah</b><br>${senaraiText(r.arah.senarai, NAMA_ARAH)}</td><td class="skor">${r.arah.skor} / 25</td></tr>
+      <tr><td><b>Aras</b><br>${senaraiText(r.aras.senarai)}</td><td class="skor">${r.aras.skor} / 25</td></tr>
+      <tr><td><b>Laluan</b><br>${laluanTxt}</td><td class="skor">${r.laluan.skor} / 25</td></tr>
+      <tr><td><b>Kelajuan</b><br>${senaraiText(r.laju.senarai)}</td><td class="skor">${r.laju.skor} / 25</td></tr>
+      <tr class="jumlah"><td>Jumlah</td><td class="skor">${r.jumlah} / 100</td></tr>
+    </table>`;
+}
+
+btnMula.addEventListener("click", async () => {
+  try {
+    btnMula.disabled = true;
+    btnHantar.disabled = true;
+    hasil.innerHTML = "";
+    live.textContent = "";
+    recSeconds = Number($("tempoh").value);
+    if (!poseLandmarker) await loadModel();
+    await startCamera($("kamera").value);
+    calib = []; samples = []; trail = []; lastResult = null;
+    lastVideoTime = -1;
+    phase = "calib";
+    phaseStart = performance.now() / 1000;
+    if (!running) { running = true; loop(); }
+  } catch (err) {
+    stop("Ralat: " + err.message);
+  }
+});
+
+btnHantar.addEventListener("click", async () => {
+  const nama = $("nama").value.trim();
+  if (!nama) { hud.textContent = "Sila tulis nama murid dahulu."; return; }
+  if (!lastResult) return;
+  if (APPS_SCRIPT_URL.startsWith("TEMPEL")) { hud.textContent = "URL Apps Script belum ditetapkan dalam kod."; return; }
+  const r = lastResult;
+  const data = {
+    standard: "1.2.3",
+    nama,
+    kelas: $("kelas").value.trim(),
+    arah: r.arah.skor,
+    aras: r.aras.skor,
+    laluan: r.laluan.skor,
+    kelajuan: r.laju.skor,
+    jumlah: r.jumlah,
+    butiran:
+      "Arah: " + senaraiText(r.arah.senarai) +
+      "; Aras: " + senaraiText(r.aras.senarai) +
+      "; Laluan: " + (r.laluan.lurus ? "lurus" : "tiada lurus") + ", pusingan " + r.laluan.pusingan +
+      "; Kelajuan: " + senaraiText(r.laju.senarai)
+  };
+  try {
+    btnHantar.disabled = true;
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(data)
+    });
+    hud.textContent = "Keputusan dihantar! Semak Google Sheets.";
+  } catch (err) {
+    hud.textContent = "Gagal hantar: " + err.message;
+    btnHantar.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
